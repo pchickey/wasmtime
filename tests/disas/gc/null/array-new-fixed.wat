@@ -19,9 +19,9 @@
 ;;                                 block0(v0: i64, v1: i64, v2: i64, v3: i64, v4: i64):
 ;;                                     v58 = iconst.i64 0
 ;; @0025                               trapnz v58, user18  ; v58 = 0
-;; @0025                               v6 = iconst.i32 16
+;; @0025                               v7 = iconst.i32 16
 ;;                                     v59 = iconst.i32 24
-;; @0025                               v12 = uadd_overflow_trap v6, v59, user18  ; v6 = 16, v59 = 24
+;; @0025                               v12 = uadd_overflow_trap v7, v59, user18  ; v7 = 16, v59 = 24
 ;; @0025                               v14 = iconst.i32 -134217728
 ;; @0025                               v15 = band v12, v14  ; v14 = -134217728
 ;; @0025                               trapnz v15, user18
@@ -46,10 +46,10 @@
 ;; @0025                               v37 = load.i32 notrap aligned readonly can_move v36
 ;; @0025                               store notrap aligned v37, v32+4
 ;; @0025                               store notrap aligned v24, v17
-;; @0025                               v7 = iconst.i32 3
+;; @0025                               v6 = iconst.i32 3
 ;;                                     v46 = iconst.i64 8
 ;; @0025                               v38 = iadd v32, v46  ; v46 = 8
-;; @0025                               store notrap aligned v7, v38  ; v7 = 3
+;; @0025                               store notrap aligned v6, v38  ; v6 = 3
 ;;                                     v71 = iconst.i64 16
 ;;                                     v77 = iadd v32, v71  ; v71 = 16
 ;; @0025                               store notrap aligned little v2, v77

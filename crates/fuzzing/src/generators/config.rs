@@ -10,7 +10,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use std::sync::Arc;
 use std::time::Duration;
 use wasmtime::{Engine, Module, MpkEnabled, Store};
-use wasmtime_wast_util::{limits, WastConfig, WastTest};
+use wasmtime_test_util::wast::{limits, WastConfig, WastTest};
 
 /// Configuration for `wasmtime::Config` and generated modules for a session of
 /// fuzzing.
@@ -126,7 +126,7 @@ impl Config {
     /// This will additionally update limits in the pooling allocator to be able
     /// to execute all tests.
     pub fn make_wast_test_compliant(&mut self, test: &WastTest) -> WastConfig {
-        let wasmtime_wast_util::TestConfig {
+        let wasmtime_test_util::wast::TestConfig {
             memory64,
             custom_page_sizes,
             multi_memory,
@@ -227,9 +227,9 @@ impl Config {
         // fail or not.
         WastConfig {
             collector: match self.wasmtime.collector {
-                Collector::Null => wasmtime_wast_util::Collector::Null,
+                Collector::Null => wasmtime_test_util::wast::Collector::Null,
                 Collector::DeferredReferenceCounting => {
-                    wasmtime_wast_util::Collector::DeferredReferenceCounting
+                    wasmtime_test_util::wast::Collector::DeferredReferenceCounting
                 }
             },
             pooling: matches!(
@@ -237,9 +237,13 @@ impl Config {
                 InstanceAllocationStrategy::Pooling(_)
             ),
             compiler: match self.wasmtime.compiler_strategy {
-                CompilerStrategy::CraneliftNative => wasmtime_wast_util::Compiler::CraneliftNative,
-                CompilerStrategy::CraneliftPulley => wasmtime_wast_util::Compiler::CraneliftPulley,
-                CompilerStrategy::Winch => wasmtime_wast_util::Compiler::Winch,
+                CompilerStrategy::CraneliftNative => {
+                    wasmtime_test_util::wast::Compiler::CraneliftNative
+                }
+                CompilerStrategy::CraneliftPulley => {
+                    wasmtime_test_util::wast::Compiler::CraneliftPulley
+                }
+                CompilerStrategy::Winch => wasmtime_test_util::wast::Compiler::Winch,
             },
         }
     }
@@ -413,7 +417,7 @@ impl Config {
         }
 
         if self.wasmtime.async_config != AsyncConfig::Disabled {
-            log::debug!("async config in used {:?}", self.wasmtime.async_config);
+            log::debug!("async config in use {:?}", self.wasmtime.async_config);
             self.wasmtime.async_config.configure(&mut cfg);
         }
 
@@ -432,20 +436,25 @@ impl Config {
     /// Configures a store based on this configuration.
     pub fn configure_store(&self, store: &mut Store<StoreLimits>) {
         store.limiter(|s| s as &mut dyn wasmtime::ResourceLimiter);
+
+        // Configure the store to never abort by default, that is it'll have
+        // max fuel or otherwise trap on an epoch change but the epoch won't
+        // ever change.
+        //
+        // Afterwards though see what `AsyncConfig` is being used an further
+        // refine the store's configuration based on that.
+        if self.wasmtime.consume_fuel {
+            store.set_fuel(u64::MAX).unwrap();
+        }
+        if self.wasmtime.epoch_interruption {
+            store.epoch_deadline_trap();
+            store.set_epoch_deadline(1);
+        }
         match self.wasmtime.async_config {
-            AsyncConfig::Disabled => {
-                if self.wasmtime.consume_fuel {
-                    store.set_fuel(u64::MAX).unwrap();
-                }
-                if self.wasmtime.epoch_interruption {
-                    store.epoch_deadline_trap();
-                    store.set_epoch_deadline(1);
-                }
-            }
+            AsyncConfig::Disabled => {}
             AsyncConfig::YieldWithFuel(amt) => {
                 assert!(self.wasmtime.consume_fuel);
                 store.fuel_async_yield_interval(Some(amt)).unwrap();
-                store.set_fuel(amt).unwrap();
             }
             AsyncConfig::YieldWithEpochs { ticks, .. } => {
                 assert!(self.wasmtime.epoch_interruption);
@@ -522,7 +531,7 @@ impl<'a> Arbitrary<'a> for Config {
 
         config
             .wasmtime
-            .update_module_config(&mut config.module_config.config, u)?;
+            .update_module_config(&mut config.module_config, u)?;
 
         Ok(config)
     }
@@ -599,7 +608,7 @@ impl WasmtimeConfig {
     /// too.
     pub fn update_module_config(
         &mut self,
-        config: &mut wasm_smith::Config,
+        config: &mut ModuleConfig,
         u: &mut Unstructured<'_>,
     ) -> arbitrary::Result<()> {
         match self.compiler_strategy {
@@ -622,10 +631,11 @@ impl WasmtimeConfig {
                 // at this time, so if winch is selected be sure to disable wasm
                 // proposals in `Config` to ensure that Winch can compile the
                 // module that wasm-smith generates.
-                config.relaxed_simd_enabled = false;
-                config.gc_enabled = false;
-                config.tail_call_enabled = false;
-                config.reference_types_enabled = false;
+                config.config.relaxed_simd_enabled = false;
+                config.config.gc_enabled = false;
+                config.config.tail_call_enabled = false;
+                config.config.reference_types_enabled = false;
+                config.function_references_enabled = false;
 
                 // Winch's SIMD implementations require AVX and AVX2.
                 if self
@@ -635,7 +645,7 @@ impl WasmtimeConfig {
                         .codegen_flag("has_avx2")
                         .is_some_and(|value| value == "false")
                 {
-                    config.simd_enabled = false;
+                    config.config.simd_enabled = false;
                 }
 
                 // Tuning  the following engine options is currently not supported
@@ -646,7 +656,7 @@ impl WasmtimeConfig {
             }
 
             CompilerStrategy::CraneliftPulley => {
-                config.threads_enabled = false;
+                config.config.threads_enabled = false;
             }
         }
 
@@ -656,7 +666,8 @@ impl WasmtimeConfig {
         // and for wasm threads that will require some refactoring of the
         // `LinearMemory` trait to bubble up the request that the linear memory
         // not move. Otherwise that just generates a panic right now.
-        if config.threads_enabled || matches!(self.strategy, InstanceAllocationStrategy::Pooling(_))
+        if config.config.threads_enabled
+            || matches!(self.strategy, InstanceAllocationStrategy::Pooling(_))
         {
             self.avoid_custom_unaligned_memory(u)?;
         }
@@ -667,31 +678,38 @@ impl WasmtimeConfig {
             // If the pooling allocator is used, do not allow shared memory to
             // be created. FIXME: see
             // https://github.com/bytecodealliance/wasmtime/issues/4244.
-            config.threads_enabled = false;
+            config.config.threads_enabled = false;
 
             // Ensure the pooling allocator can support the maximal size of
             // memory, picking the smaller of the two to win.
             let min_bytes = config
+                .config
                 .max_memory32_bytes
                 // memory64_bytes is a u128, but since we are taking the min
                 // we can truncate it down to a u64.
-                .min(config.max_memory64_bytes.try_into().unwrap_or(u64::MAX));
+                .min(
+                    config
+                        .config
+                        .max_memory64_bytes
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                );
             let mut min = min_bytes.min(pooling.max_memory_size as u64);
             if let MemoryConfig::Normal(cfg) = &self.memory_config {
                 min = min.min(cfg.memory_reservation.unwrap_or(0));
             }
             pooling.max_memory_size = min as usize;
-            config.max_memory32_bytes = min;
-            config.max_memory64_bytes = min as u128;
+            config.config.max_memory32_bytes = min;
+            config.config.max_memory64_bytes = min as u128;
 
             // If traps are disallowed then memories must have at least one page
             // of memory so if we still are only allowing 0 pages of memory then
             // increase that to one here.
-            if config.disallow_traps {
+            if config.config.disallow_traps {
                 if pooling.max_memory_size < (1 << 16) {
                     pooling.max_memory_size = 1 << 16;
-                    config.max_memory32_bytes = 1 << 16;
-                    config.max_memory64_bytes = 1 << 16;
+                    config.config.max_memory32_bytes = 1 << 16;
+                    config.config.max_memory64_bytes = 1 << 16;
                     if let MemoryConfig::Normal(cfg) = &mut self.memory_config {
                         match &mut cfg.memory_reservation {
                             Some(size) => *size = (*size).max(pooling.max_memory_size as u64),
@@ -707,13 +725,13 @@ impl WasmtimeConfig {
 
             // Don't allow too many linear memories per instance since massive
             // virtual mappings can fail to get allocated.
-            config.min_memories = config.min_memories.min(10);
-            config.max_memories = config.max_memories.min(10);
+            config.config.min_memories = config.config.min_memories.min(10);
+            config.config.max_memories = config.config.max_memories.min(10);
 
             // Force this pooling allocator to always be able to accommodate the
             // module that may be generated.
-            pooling.total_memories = config.max_memories as u32;
-            pooling.total_tables = config.max_tables as u32;
+            pooling.total_memories = config.config.max_memories as u32;
+            pooling.total_tables = config.config.max_tables as u32;
         }
 
         if !self.signals_based_traps {
@@ -723,7 +741,7 @@ impl WasmtimeConfig {
             // fixable with some more work on the bounds-checks side of things
             // to do a full bounds check even on static memories, but that's
             // left for a future PR.
-            config.threads_enabled = false;
+            config.config.threads_enabled = false;
 
             // Spectre-based heap mitigations require signal handlers so this
             // must always be disabled if signals-based traps are disabled.

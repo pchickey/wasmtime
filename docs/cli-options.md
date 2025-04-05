@@ -27,11 +27,10 @@ module. This means that the module will be compiled to native code,
 instantiated, and then optionally have an export executed.
 
 The `wasmtime` CLI will automatically hook up any WASI-related imported
-functionality, but at this time if your module imports anything else it will
+functionality, but at this time, if your module imports anything else, it will
 fail instantiation.
 
-The `run` command takes one positional argument which is the name of the module
-to run:
+The `run` command takes one positional argument, which is the name of the module to run:
 
 ```sh
 $ wasmtime run foo.wasm
@@ -45,11 +44,29 @@ as well as the text format for WebAssembly (`*.wat`):
 $ wasmtime foo.wat
 ```
 
-The `run` command accepts an optional `invoke` argument which is the name of
+The `run` command accepts an optional `--invoke` argument, which is the name of
 an exported function of the module to run.
 
 ```sh
-$ wasmtime run foo.wasm --invoke initialize
+$ wasmtime run --invoke 'initialize()' foo.wasm
+```
+
+The exported function's name and exported function's parentheses must both be enclosed in one set of single quotes, i.e. `'initialize()'`. 
+This treats the exported function as a single argument and prevents issues with shell interpretation.
+The presence of the parenthesis `()` signifies function invocation, as apposed to the function name just being referenced.
+This convention helps to distinguish function calls from other kinds of string arguments.
+
+Each individual argument within the parentheses must be separated by a comma:
+
+```sh
+$ wasmtime run --invoke 'initialize("Pi", 3.14)' foo.wasm
+$ wasmtime run --invoke 'add(1, 2)' foo.wasm
+```
+
+**Please note:** If you enclose your function call using double quotes, your string argument will require its double quotes to be escaped (escaping quotes is more complicated and harder to read and therefore not ideal). For example:
+
+```bash
+$ wasmtime run - invoke "initialize(\"hello\")" foo.wasm
 ```
 
 ## `serve`
@@ -125,6 +142,57 @@ display what Cranelift settings are inferred for the host:
 
 ```sh
 $ wasmtime settings
+```
+
+## `explore`
+
+This subcommand can be used to explore a `*.cwasm` file and see how it connects
+to the original wasm file in a web browser. This will compile an input wasm
+file and emit an HTML file that can be opened in a web browser:
+
+```sh
+$ wasmtime explore foo.wasm
+Exploration written to foo.explore.html
+```
+
+The output HTML file can be used to compare what WebAssembly instruction
+compiles to what native instruction. Compilation options can be passed to
+`wasmtime explore` to see the effect of compilation options on generated code.
+
+## `objdump`
+
+Primarily intended as a debugging utility the `objdump` subcommand can be used
+to explore a `*.cwasm` file locally on your terminal. This is roughly modeled
+after native `objdump` binaries themselves:
+
+```sh
+$ wasmtime objdump foo.cwasm
+wasm[0]::function[0]:
+            stp     x29, x30, [sp, #-0x10]!
+            mov     x29, sp
+            ldr     x5, [x2, #0x50]
+            lsl     w6, w4, #2
+            ldr     w2, [x5, w6, uxtw]
+            ldp     x29, x30, [sp], #0x10
+            ret
+```
+
+You can also pass various options to configure and annotate the output:
+
+```sh
+$ wasmtime objdump foo.cwasm --addresses --bytes --addrma
+00000000 wasm[0]::function[0]:
+         0: fd 7b bf a9                  stp     x29, x30, [sp, #-0x10]!
+         4: fd 03 00 91                  mov     x29, sp
+         8: 45 28 40 f9                  ldr     x5, [x2, #0x50]
+                                          ╰─╼ addrmap: 0x23
+         c: 86 74 1e 53                  lsl     w6, w4, #2
+                                          ╰─╼ addrmap: 0x22
+        10: a2 48 66 b8                  ldr     w2, [x5, w6, uxtw]
+                                          ╰─╼ addrmap: 0x23
+        14: fd 7b c1 a8                  ldp     x29, x30, [sp], #0x10
+                                          ╰─╼ addrmap: 0x26
+        18: c0 03 5f d6                  ret
 ```
 
 # Additional options

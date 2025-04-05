@@ -51,22 +51,33 @@ impl FreeList {
             layout.align(),
         );
 
-        ensure!(
-            layout.size() <= self.max_size(),
-            "requested allocation's size of {} is greater than the max supported size of {}",
-            layout.size(),
-            self.max_size(),
-        );
+        if layout.size() > self.max_size() {
+            let trap = crate::Trap::AllocationTooLarge;
+            let err = anyhow::Error::from(trap);
+            let err = err.context(format!(
+                "requested allocation's size of {} is greater than the max supported size of {}",
+                layout.size(),
+                self.max_size(),
+            ));
+            return Err(err);
+        }
 
-        let alloc_size = u32::try_from(layout.size())
-            .context("requested allocation's size does not fit in a u32")?;
+        let alloc_size = u32::try_from(layout.size()).map_err(|e| {
+            let trap = crate::Trap::AllocationTooLarge;
+            let err = anyhow::Error::from(trap);
+            err.context(e)
+                .context("requested allocation's size does not fit in a u32")
+        })?;
         alloc_size
             .checked_next_multiple_of(ALIGN_U32)
             .ok_or_else(|| {
-                anyhow!(
+                let trap = crate::Trap::AllocationTooLarge;
+                let err = anyhow::Error::from(trap);
+                let err = err.context(format!(
                     "failed to round allocation size of {alloc_size} up to next \
                      multiple of {ALIGN_USIZE}"
-                )
+                ));
+                err
             })
     }
 
@@ -310,14 +321,6 @@ fn blocks_are_contiguous(prev_index: u32, prev_len: u32, next_index: u32) -> boo
     // the size of the `Layout` given to us upon deallocation (aka `prev_len`)
     // is smaller than the actual size of the block we allocated.
     let end_of_prev = prev_index + prev_len;
-    log::trace!(
-        "checking for overlapping blocks: \n\
-         \t prev_index = {prev_index:#x}\n\
-         \t   prev_len = {prev_len:#x}\n\
-         \tend_of_prev = {end_of_prev:#x}\n\
-         \t next_index = {next_index:#x}\n\
-         `next_index` should be >= `end_of_prev`"
-    );
     debug_assert!(
         next_index >= end_of_prev,
         "overlapping blocks: \n\
