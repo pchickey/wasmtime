@@ -627,6 +627,9 @@ wasmtime_option_group! {
         pub p3: Option<bool>,
         /// Maximum resources the guest is allowed to create simultaneously.
         pub max_resources: Option<usize>,
+        /// Maximum number of host file descriptors the guest is allowed to
+        /// have open simultaneously. Opening more fails with an error.
+        pub max_open_files: Option<usize>,
         /// Fuel to use for all hostcalls to limit guest<->host data transfer.
         pub hostcall_fuel: Option<usize>,
         /// Maximum value, in bytes, for a wasi-random 0.2

@@ -1,5 +1,6 @@
 use crate::clocks::Datetime;
 use crate::filesystem::primitives::{FollowSymlinks, Metadata, OpenOptions};
+use crate::permits::{HostResource, PermitDenied, Permitted, ResourcePermits};
 use crate::runtime::{AbortOnDropJoinHandle, spawn_blocking};
 use crate::{NamedId, WasiCtxNamedView};
 use std::collections::hash_map;
@@ -69,6 +70,7 @@ impl HasData for WasiFilesystem {
 pub struct WasiFilesystemCtx {
     pub(crate) allow_blocking_current_thread: bool,
     pub(crate) preopens: Vec<(Dir, String)>,
+    pub(crate) permits: ResourcePermits,
 }
 
 pub struct WasiFilesystemCtxView<'a> {
@@ -475,6 +477,12 @@ impl<'a> From<&'a std::io::Error> for ErrorCode {
     }
 }
 
+impl From<PermitDenied> for ErrorCode {
+    fn from(_: PermitDenied) -> ErrorCode {
+        ErrorCode::InsufficientMemory
+    }
+}
+
 impl From<std::io::Error> for ErrorCode {
     fn from(err: std::io::Error) -> ErrorCode {
         ErrorCode::from(&err)
@@ -674,8 +682,9 @@ pub struct File {
     ///
     /// Wrapped in an Arc because the same underlying file is used for
     /// implementing the stream types. A copy is also needed for
-    /// `spawn_blocking`.
-    pub file: Arc<std::fs::File>,
+    /// `spawn_blocking`. The file is owned along with the permit that allowed
+    /// it to be opened, which is released once the file is closed.
+    pub file: Arc<Permitted<std::fs::File>>,
     /// Permissions to enforce on access to the file. These permissions are
     /// specified to the parent preopen by a user of the
     /// `crate::WasiCtxBuilder`, and are enforced prior to any enforced by the
@@ -693,6 +702,20 @@ pub struct File {
 impl File {
     pub fn new(
         file: std::fs::File,
+        perms: FsPerms,
+        open_mode: OpenMode,
+        allow_blocking_current_thread: bool,
+    ) -> Self {
+        Self::from_permitted(
+            Permitted::unlimited(file),
+            perms,
+            open_mode,
+            allow_blocking_current_thread,
+        )
+    }
+
+    pub(crate) fn from_permitted(
+        file: Permitted<std::fs::File>,
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
@@ -752,7 +775,7 @@ impl File {
 
     /// Returns reference to the underlying [`std::fs::File`]
     #[cfg(feature = "p3")]
-    pub(crate) fn as_file(&self) -> &Arc<std::fs::File> {
+    pub(crate) fn as_file(&self) -> &Arc<Permitted<std::fs::File>> {
         &self.file
     }
 
@@ -784,8 +807,10 @@ pub struct Dir {
     /// This is a handle to a directory, and all paths accessed through this
     /// struct are sandboxed to be within this directory via `cap-primitives`.
     ///
-    /// Wrapped in an Arc because a copy is needed for `run_blocking`.
-    pub dir: Arc<std::fs::File>,
+    /// Wrapped in an Arc because a copy is needed for `run_blocking`. The
+    /// directory is owned along with the permit that allowed it to be opened,
+    /// which is released once the directory is closed.
+    pub dir: Arc<Permitted<std::fs::File>>,
     /// Permissions to enforce on access to the filesystem under this
     /// directory are specified by a user of the `crate::WasiCtxBuilder`, and
     /// are enforced prior to any enforced by the underlying operating system.
@@ -805,6 +830,20 @@ pub struct Dir {
 impl Dir {
     pub fn new(
         dir: std::fs::File,
+        perms: FsPerms,
+        open_mode: OpenMode,
+        allow_blocking_current_thread: bool,
+    ) -> Self {
+        Self::from_permitted(
+            Permitted::unlimited(dir),
+            perms,
+            open_mode,
+            allow_blocking_current_thread,
+        )
+    }
+
+    pub(crate) fn from_permitted(
+        dir: Permitted<std::fs::File>,
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
@@ -846,7 +885,7 @@ impl Dir {
 
     /// Returns reference to the underlying directory handle.
     #[cfg(feature = "p3")]
-    pub(crate) fn as_dir(&self) -> &Arc<std::fs::File> {
+    pub(crate) fn as_dir(&self) -> &Arc<Permitted<std::fs::File>> {
         &self.dir
     }
 
@@ -938,6 +977,7 @@ impl Dir {
         oflags: OpenFlags,
         flags: DescriptorFlags,
         allow_blocking_current_thread: bool,
+        permits: &ResourcePermits,
     ) -> Result<Descriptor, ErrorCode> {
         // Track whether we are creating file, for permission check:
         let mut create = false;
@@ -1007,52 +1047,46 @@ impl Dir {
             }
         }
 
-        // Represents each possible outcome from the spawn_blocking operation.
-        // This makes sure we don't have to give spawn_blocking any way to
-        // manipulate the table.
-        enum OpenResult {
-            Dir(std::fs::File),
-            File(std::fs::File),
-            NotDir,
-        }
-
-        let opened = self
-            .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let opened = crate::filesystem::primitives::open(d, path.as_ref(), &opts)?;
-                if Metadata::from_file(&opened)?.is_dir() {
-                    Ok(OpenResult::Dir(opened))
-                } else if oflags.contains(OpenFlags::DIRECTORY) {
-                    Ok(OpenResult::NotDir)
-                } else {
-                    Ok(OpenResult::File(opened))
-                }
+        // Acquire a permit for the new file descriptor before opening it. The
+        // opened file is owned along with its permit, so that the permit is
+        // released once the file is closed.
+        let opened = permits
+            .acquire(HostResource::FileDescriptor, || {
+                self.run_blocking::<_, Result<(std::fs::File, bool), ErrorCode>>(move |d| {
+                    let opened = crate::filesystem::primitives::open(d, path.as_ref(), &opts)?;
+                    let is_dir = Metadata::from_file(&opened)?.is_dir();
+                    if !is_dir && oflags.contains(OpenFlags::DIRECTORY) {
+                        return Err(ErrorCode::NotDirectory);
+                    }
+                    Ok((opened, is_dir))
+                })
             })
             .await?;
+        let is_dir = opened.1;
+        let opened = opened.map(|(file, _)| file);
 
-        match opened {
+        if is_dir {
             // Paper over a divergence between Windows and POSIX, where
             // POSIX returns EISDIR if you open a directory with the
             // WRITE flag: https://pubs.opengroup.org/onlinepubs/9699919799/functions/open.html#:~:text=EISDIR
             #[cfg(windows)]
-            OpenResult::Dir(_) if flags.contains(DescriptorFlags::WRITE) => {
-                Err(ErrorCode::IsDirectory)
+            if flags.contains(DescriptorFlags::WRITE) {
+                return Err(ErrorCode::IsDirectory);
             }
 
-            OpenResult::Dir(dir) => Ok(Descriptor::Dir(Dir::new(
-                dir,
+            Ok(Descriptor::Dir(Dir::from_permitted(
+                opened,
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
-            ))),
-
-            OpenResult::File(file) => Ok(Descriptor::File(File::new(
-                file,
+            )))
+        } else {
+            Ok(Descriptor::File(File::from_permitted(
+                opened,
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
-            ))),
-
-            OpenResult::NotDir => Err(ErrorCode::NotDirectory),
+            )))
         }
     }
 

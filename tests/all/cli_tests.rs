@@ -2596,6 +2596,45 @@ start a print 1234
         Ok(())
     }
 
+    fn run_max_open_files(component: &str, extra: &[&str]) -> Result<()> {
+        // The test programs expect to be able to open exactly 10 files.
+        for (limit, ok) in [(10, true), (9, false)] {
+            let dir = tempfile::tempdir()?;
+            let mut args = vec!["run".to_string(), format!("-Smax-open-files={limit}")];
+            args.extend(extra.iter().map(|s| s.to_string()));
+            args.push(format!("--dir={}::.", dir.path().to_str().unwrap()));
+            args.push(component.to_string());
+            args.push(".".to_string());
+            let args = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+            let result = run_wasmtime(&args);
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "unexpected result with -Smax-open-files={limit}: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn p1_max_open_files() -> Result<()> {
+        run_max_open_files(P1_MAX_OPEN_FILES_COMPONENT, &[])
+    }
+
+    #[test]
+    fn p2_max_open_files() -> Result<()> {
+        run_max_open_files(P2_MAX_OPEN_FILES_COMPONENT, &[])
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "component-model-async"), ignore)]
+    fn p3_max_open_files() -> Result<()> {
+        run_max_open_files(
+            P3_MAX_OPEN_FILES_COMPONENT,
+            &["-Wcomponent-model-async", "-Sp3"],
+        )
+    }
+
     #[tokio::test]
     #[cfg_attr(not(feature = "component-model-async"), ignore)]
     async fn p3_cli_serve_hello_world() -> Result<()> {

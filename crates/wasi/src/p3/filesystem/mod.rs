@@ -229,6 +229,12 @@ impl From<crate::filesystem::ErrorCode> for types::ErrorCode {
     }
 }
 
+impl From<crate::permits::PermitDenied> for types::ErrorCode {
+    fn from(denied: crate::permits::PermitDenied) -> Self {
+        crate::filesystem::ErrorCode::from(denied).into()
+    }
+}
+
 impl From<crate::filesystem::ErrorCode> for FilesystemError {
     fn from(error: crate::filesystem::ErrorCode) -> Self {
         types::ErrorCode::from(error).into()

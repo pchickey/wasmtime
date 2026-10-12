@@ -4,6 +4,7 @@ use test_programs_artifacts::*;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Result, error::Context as _, format_err};
 use wasmtime_wasi::p3::bindings::Command;
+use wasmtime_wasi::permits::MaxFileDescriptors;
 use wasmtime_wasi::{
     FsPerms, NamedId, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiNamedView, WasiView,
 };
@@ -236,6 +237,22 @@ async fn p3_file_write() -> wasmtime::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_file_write_blocking() -> wasmtime::Result<()> {
     run_allow_blocking_current_thread(P3_FILE_WRITE_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_max_open_files() -> wasmtime::Result<()> {
+    run_with_builder(P3_MAX_OPEN_FILES_COMPONENT, false, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_max_open_files_blocking() -> wasmtime::Result<()> {
+    run_with_builder(P3_MAX_OPEN_FILES_COMPONENT, true, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .await
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]

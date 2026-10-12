@@ -4,6 +4,7 @@ use test_programs_artifacts::*;
 use wasmtime::Result;
 use wasmtime::{Linker, Module};
 use wasmtime_wasi::p1::{WasiP1Ctx, add_to_linker_async};
+use wasmtime_wasi::permits::MaxFileDescriptors;
 use wasmtime_wasi::{WasiCtxBuilder, WasiView};
 
 async fn run(path: &str, with_builder: impl FnOnce(&mut WasiCtxBuilder)) -> Result<()> {
@@ -130,6 +131,14 @@ async fn p1_file_write() {
 async fn p1_path_open_lots() {
     run(P1_PATH_OPEN_LOTS, |b| {
         b.inherit_stdio();
+    })
+    .await
+    .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p1_max_open_files() {
+    run(P1_MAX_OPEN_FILES, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
     })
     .await
     .unwrap()

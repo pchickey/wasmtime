@@ -288,6 +288,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
                 oflags.into(),
                 flags.into(),
                 self.ctx.allow_blocking_current_thread,
+                &self.ctx.permits,
             )
             .await?;
         let fd = self.table.push(fd)?;

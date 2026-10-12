@@ -379,6 +379,9 @@ impl RunCommon {
         if let Some(max_size) = self.common.wasi.max_random_size {
             builder.max_random_size(max_size);
         }
+        if let Some(max) = self.common.wasi.max_open_files {
+            builder.resource_permitter(wasmtime_wasi::permits::MaxFileDescriptors::new(max));
+        }
 
         Ok(())
     }

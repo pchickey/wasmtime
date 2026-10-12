@@ -5,6 +5,7 @@ use wasmtime::Result;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::p2::bindings::Command;
+use wasmtime_wasi::permits::MaxFileDescriptors;
 use wasmtime_wasi::{NamedId, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiNamedView, WasiView};
 
 async fn run(path: &str, with_builder: impl FnOnce(&mut WasiCtxBuilder)) -> Result<()> {
@@ -129,6 +130,22 @@ async fn p1_file_write() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_path_open_lots() {
     run(P1_PATH_OPEN_LOTS_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p1_max_open_files() {
+    run(P1_MAX_OPEN_FILES_COMPONENT, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .await
+    .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_max_open_files() {
+    run(P2_MAX_OPEN_FILES_COMPONENT, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .await
+    .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_sleep_quickly_but_lots() {
@@ -257,6 +274,60 @@ async fn p2_adapter_badfd() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_file_read_write() {
     run(P2_FILE_READ_WRITE_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_read_write_pending_permits() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+    use wasmtime_wasi::permits::{HostResource, PermitDenied, PermitGuard, ResourcePermitter};
+
+    // A policy which waits for a permit to become available, rather than
+    // denying it.
+    struct Waiting {
+        semaphore: Arc<Semaphore>,
+        granted: Arc<AtomicUsize>,
+    }
+
+    impl ResourcePermitter for Waiting {
+        fn permit(
+            &self,
+            _resource: HostResource,
+        ) -> Pin<Box<dyn Future<Output = Result<PermitGuard, PermitDenied>> + Send + '_>> {
+            Box::pin(async move {
+                let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+                self.granted.fetch_add(1, Ordering::SeqCst);
+                Ok(PermitGuard::new(permit))
+            })
+        }
+    }
+
+    // No permits are available at first, so the guest's opens will be
+    // pending until they are released below.
+    let semaphore = Arc::new(Semaphore::new(0));
+    let granted = Arc::new(AtomicUsize::new(0));
+    let releaser = tokio::spawn({
+        let semaphore = semaphore.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            semaphore.add_permits(16);
+        }
+    });
+    let policy = Waiting {
+        semaphore: semaphore.clone(),
+        granted: granted.clone(),
+    };
+    run(P2_FILE_READ_WRITE_COMPONENT, move |b| {
+        b.resource_permitter(policy);
+    })
+    .await
+    .unwrap();
+    releaser.await.unwrap();
+    assert!(granted.load(Ordering::SeqCst) > 0);
+    // All permits are returned once the guest's files are closed.
+    assert_eq!(semaphore.available_permits(), 16);
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_close_preopen() {

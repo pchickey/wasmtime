@@ -6,6 +6,7 @@ use wasmtime::component::{Component, Linker};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p2::add_to_linker_sync;
 use wasmtime_wasi::p2::bindings::sync::Command;
+use wasmtime_wasi::permits::MaxFileDescriptors;
 
 fn run(path: &str, with_builder: impl Fn(&mut WasiCtxBuilder)) -> Result<()> {
     run_with_workspace_setup(path, |_| Ok(()), with_builder)
@@ -128,6 +129,20 @@ fn p1_file_write() {
 #[test_log::test]
 fn p1_path_open_lots() {
     run(P1_PATH_OPEN_LOTS_COMPONENT, |_| {}).unwrap()
+}
+#[test_log::test]
+fn p1_max_open_files() {
+    run(P1_MAX_OPEN_FILES_COMPONENT, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .unwrap()
+}
+#[test_log::test]
+fn p2_max_open_files() {
+    run(P2_MAX_OPEN_FILES_COMPONENT, |b| {
+        b.resource_permitter(MaxFileDescriptors::new(10));
+    })
+    .unwrap()
 }
 #[test_log::test]
 fn p1_sleep_quickly_but_lots() {

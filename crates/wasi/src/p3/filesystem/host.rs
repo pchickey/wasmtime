@@ -7,6 +7,7 @@ use crate::p3::bindings::filesystem::types::{
 };
 use crate::p3::filesystem::{FilesystemError, FilesystemResult, preopens};
 use crate::p3::{DEFAULT_BUFFER_CAPACITY, FallibleIteratorProducer};
+use crate::permits::{HostResource, Permitted, ResourcePermits};
 use bytes::BytesMut;
 use core::pin::Pin;
 use core::task::{Context, Poll, ready};
@@ -19,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
-    StreamProducer, StreamReader, StreamResult,
+    StreamProducer, StreamReader, StreamResult, VecBuffer,
 };
 use wasmtime::error::Context as _;
 use wasmtime::{AsContextMut, StoreContextMut};
@@ -247,6 +248,17 @@ fn map_dir_entry(
     }
 }
 
+/// Iterator over the entries of a directory, which owns a newly opened file
+/// descriptor for the directory.
+type ReadDirIter = Box<dyn Iterator<Item = Result<DirectoryEntry, ErrorCode>> + Send>;
+
+fn open_read_dir(dir: &std::fs::File) -> Result<ReadDirIter, ErrorCode> {
+    let entries = crate::filesystem::primitives::read_dir(dir)?;
+    Ok(Box::new(
+        entries.filter_map(|e| map_dir_entry(e).transpose()),
+    ))
+}
+
 struct ReadDirStream {
     rx: mpsc::Receiver<DirectoryEntry>,
     task: JoinHandle<Result<(), ErrorCode>>,
@@ -255,21 +267,34 @@ struct ReadDirStream {
 
 impl ReadDirStream {
     fn new(
-        dir: Arc<std::fs::File>,
+        dir: Arc<Permitted<std::fs::File>>,
+        permits: ResourcePermits,
         result: oneshot::Sender<Result<(), ErrorCode>>,
     ) -> ReadDirStream {
         let (tx, rx) = mpsc::channel(1);
         ReadDirStream {
-            task: spawn_blocking(move || {
-                let entries = crate::filesystem::primitives::read_dir(&dir)?;
-                for entry in entries {
-                    if let Some(entry) = map_dir_entry(entry)? {
-                        if let Err(_) = tx.blocking_send(entry) {
+            task: tokio::spawn(async move {
+                // Reading the directory opens a new file descriptor, which
+                // requires a permit. The permit moves along with the iterator
+                // into the blocking task, and is released when the iterator
+                // is dropped.
+                let entries = permits
+                    .acquire(HostResource::FileDescriptor, || async move {
+                        spawn_blocking(move || open_read_dir(&dir))
+                            .await
+                            .expect("spawned task should not panic")
+                    })
+                    .await?;
+                spawn_blocking(move || {
+                    for entry in entries {
+                        if let Err(_) = tx.blocking_send(entry?) {
                             break;
                         }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
+                .await
+                .expect("spawned task should not panic")
             }),
             rx,
             result: Some(result),
@@ -541,6 +566,7 @@ fn write_via_stream(
 fn read_directory(
     mut store: impl AsContextMut,
     dir: FilesystemResult<Dir>,
+    permits: ResourcePermits,
 ) -> wasmtime::Result<(
     StreamReader<DirectoryEntry>,
     FutureReader<Result<(), ErrorCode>>,
@@ -552,21 +578,12 @@ fn read_directory(
             let allow_blocking_current_thread = dir.allow_blocking_current_thread;
             let dir = Arc::clone(dir.as_dir());
             if allow_blocking_current_thread {
-                match crate::filesystem::primitives::read_dir(&dir) {
-                    Ok(readdir) => StreamReader::new(
-                        &mut store,
-                        FallibleIteratorProducer::new(
-                            readdir.filter_map(|e| map_dir_entry(e).transpose()),
-                            result_tx,
-                        ),
-                    )?,
-                    Err(e) => {
-                        let _ = result_tx.send(Err(e.into()));
-                        StreamReader::new(&mut store, iter::empty())?
-                    }
-                }
+                StreamReader::new(
+                    &mut store,
+                    BlockingReadDirStream::new(dir, permits, result_tx),
+                )?
             } else {
-                StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
+                StreamReader::new(&mut store, ReadDirStream::new(dir, permits, result_tx))?
             }
         }
         Err(err) => {
@@ -575,6 +592,93 @@ fn read_directory(
         }
     };
     Ok((stream, FutureReader::new(&mut store, result_rx)?))
+}
+
+/// Stream of directory entries which acquires a permit for, and opens, the
+/// directory iterator on the current thread, when blocking the current thread
+/// is allowed.
+struct BlockingReadDirStream {
+    state: BlockingReadDirState,
+}
+
+enum BlockingReadDirState {
+    Opening {
+        open: Pin<Box<dyn Future<Output = Result<Permitted<ReadDirIter>, ErrorCode>> + Send>>,
+        result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
+    },
+    Reading(FallibleIteratorProducer<Permitted<ReadDirIter>, ErrorCode>),
+}
+
+impl BlockingReadDirStream {
+    fn new(
+        dir: Arc<Permitted<std::fs::File>>,
+        permits: ResourcePermits,
+        result: oneshot::Sender<Result<(), ErrorCode>>,
+    ) -> Self {
+        let open = Box::pin(async move {
+            permits
+                .acquire(HostResource::FileDescriptor, || async move {
+                    open_read_dir(&dir)
+                })
+                .await
+        });
+        BlockingReadDirStream {
+            state: BlockingReadDirState::Opening {
+                open,
+                result: Some(result),
+            },
+        }
+    }
+}
+
+impl<D> StreamProducer<D> for BlockingReadDirStream {
+    type Item = DirectoryEntry;
+    type Buffer = VecBuffer<DirectoryEntry>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let me = &mut *self;
+        if let BlockingReadDirState::Opening { open, result } = &mut me.state {
+            let opened = match open.as_mut().poll(cx) {
+                Poll::Ready(opened) => opened,
+                Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
+                Poll::Pending => return Poll::Pending,
+            };
+            let result = result.take().unwrap();
+            match opened {
+                Ok(entries) => {
+                    me.state = BlockingReadDirState::Reading(FallibleIteratorProducer::new(
+                        entries, result,
+                    ));
+                }
+                Err(err) => {
+                    let _ = result.send(Err(err));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+            }
+        }
+        match &mut me.state {
+            BlockingReadDirState::Reading(producer) => {
+                Pin::new(producer).poll_produce(cx, store, dst, finish)
+            }
+            BlockingReadDirState::Opening { .. } => unreachable!(),
+        }
+    }
+}
+
+impl Drop for BlockingReadDirStream {
+    fn drop(&mut self) {
+        if let BlockingReadDirState::Opening { result, .. } = &mut self.state {
+            if let Some(result) = result.take() {
+                let _ = result.send(Ok(()));
+            }
+        }
+    }
 }
 
 impl WasiFilesystemCtxView<'_> {
@@ -746,6 +850,7 @@ impl WasiFilesystemCtxView<'_> {
     ) -> impl Future<Output = FilesystemResult<Descriptor>> + use<> {
         let dir = get_dir(self.table, fd).cloned();
         let allow_blocking_current_thread = self.ctx.allow_blocking_current_thread;
+        let permits = self.ctx.permits.clone();
         async move {
             let fd = dir?
                 .open_at(
@@ -754,6 +859,7 @@ impl WasiFilesystemCtxView<'_> {
                     open_flags.into(),
                     flags.into(),
                     allow_blocking_current_thread,
+                    &permits,
                 )
                 .await?;
             Ok(fd)
@@ -947,8 +1053,10 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         StreamReader<DirectoryEntry>,
         FutureReader<Result<(), ErrorCode>>,
     )> {
-        let dir = get_dir(store.get().table, &fd).cloned();
-        read_directory(&mut store, dir)
+        let fs = store.get();
+        let dir = get_dir(fs.table, &fd).cloned();
+        let permits = fs.ctx.permits.clone();
+        read_directory(&mut store, dir, permits)
     }
 
     async fn sync(store: &Accessor<U, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
@@ -1269,8 +1377,10 @@ mod named {
             StreamReader<DirectoryEntry>,
             FutureReader<Result<(), ErrorCode>>,
         )> {
-            let dir = super::get_dir(store.get().0.filesystem(id).table, &fd).cloned();
-            super::read_directory(&mut store, dir)
+            let fs = store.get().0.filesystem(id);
+            let dir = super::get_dir(fs.table, &fd).cloned();
+            let permits = fs.ctx.permits.clone();
+            super::read_directory(&mut store, dir, permits)
         }
 
         async fn sync(

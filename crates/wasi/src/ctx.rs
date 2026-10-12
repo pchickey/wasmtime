@@ -1,6 +1,7 @@
 use crate::cli::{StdinStream, StdoutStream, WasiCliCtx};
 use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
 use crate::filesystem::{Dir, WasiFilesystemCtx};
+use crate::permits::{ResourcePermits, ResourcePermitter};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
 use crate::{FsPerms, OpenMode};
@@ -40,6 +41,7 @@ pub struct WasiCtxBuilder {
     filesystem: WasiFilesystemCtx,
     random: WasiRandomCtx,
     sockets: WasiSocketsCtx,
+    permits: ResourcePermits,
     built: bool,
 }
 
@@ -349,6 +351,19 @@ impl WasiCtxBuilder {
         self
     }
 
+    /// Configures the policy used to grant permits for creating host
+    /// resources, such as file descriptors.
+    ///
+    /// Before any operation which creates a new host resource, a permit is
+    /// acquired from `permitter`. See the [`permits`](crate::permits) module
+    /// for more information.
+    ///
+    /// By default all permits are granted.
+    pub fn resource_permitter(&mut self, permitter: impl ResourcePermitter) -> &mut Self {
+        self.permits = ResourcePermits::new(permitter);
+        self
+    }
+
     /// Configures the maximum len accepted by
     /// `wasi:random/random.get-random-bytes` and
     /// `wasi:random/insecure.get-insecure-random-bytes`. Calls with a len
@@ -445,12 +460,15 @@ impl WasiCtxBuilder {
         let Self {
             cli,
             clocks,
-            filesystem,
+            mut filesystem,
             random,
             sockets,
+            permits,
             built: _,
         } = mem::replace(self, Self::new());
         self.built = true;
+
+        filesystem.permits = permits;
 
         WasiCtx {
             cli,
